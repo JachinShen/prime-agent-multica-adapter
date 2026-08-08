@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""prime-agent-multica: bridge Multica's `pi` protocol family to prime-agent.
+
+Multica's pi backend invokes the CLI as:
+    pi -p --mode json --session <path> [--provider P --model M] [custom args...]
+and for model discovery:
+    pi --list-models
+and for version detection:
+    pi --version
+
+prime-agent (the pi-mono fork) keeps `-p --mode json` and the JSON event
+stream, but renamed `--session` to `--resume` and moved model listing to
+`prime-agent model list`. This shim translates the CLI contract and then
+execs prime-agent in place (no child process to orphan, signals pass
+through, exit codes propagate).
+"""
+
+import os
+import subprocess
+import sys
+
+PRIME_AGENT = os.environ.get("PRIME_AGENT_BIN", "prime-agent")
+
+
+def resolve_prime_agent() -> str:
+    cand = PRIME_AGENT
+    if os.sep in cand or (os.altsep and os.altsep in cand):
+        return cand
+    candidates = []
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        if d:
+            candidates.append(os.path.join(d, cand))
+    # Fallbacks for daemons launched outside the user's interactive shell
+    # (desktop apps, launchd) whose PATH may miss the npm global prefix.
+    home = os.path.expanduser("~")
+    for d in (os.path.join(home, ".npm-global", "bin"),
+              os.path.join(home, ".local", "bin"),
+              "/usr/local/bin", "/opt/homebrew/bin"):
+        candidates.append(os.path.join(d, cand))
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return cand
+
+
+def show_version() -> int:
+    bin_ = resolve_prime_agent()
+    try:
+        r = subprocess.run([bin_, "--version"], capture_output=True, text=True, timeout=60)
+    except Exception as e:  # noqa: BLE001
+        print(f"prime-agent-multica: version probe failed: {e}", file=sys.stderr)
+        return 1
+    # prime-agent prints the version to stderr; Multica reads stdout.
+    out = (r.stdout or "").strip() or (r.stderr or "").strip()
+    if out:
+        print(out)
+    return r.returncode
+
+
+def list_models() -> int:
+    bin_ = resolve_prime_agent()
+    try:
+        r = subprocess.run([bin_, "model", "list"], capture_output=True, text=True, timeout=180)
+    except Exception as e:  # noqa: BLE001
+        print(f"prime-agent-multica: model list failed: {e}", file=sys.stderr)
+        return 1
+    combined = (r.stdout or "") + "\n" + (r.stderr or "")
+    for line in combined.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        prov, model = fields[0], fields[1]
+        low = prov.lower()
+        if low == "provider":
+            continue  # table header
+        if low.startswith("(") or low.startswith("warning") or low.startswith("error") or low.startswith("info"):
+            continue  # node shim warnings / diagnostics
+        if "node:" in prov.lower():
+            continue
+        print(f"{prov} {model}")
+    return 0
+
+
+def run_mode(args: list[str]) -> int:
+    translated: list[str] = []
+    i = 0
+    n = len(args)
+    while i < n:
+        a = args[i]
+        if a == "--session":
+            if i + 1 >= n:
+                print("prime-agent-multica: --session requires a value", file=sys.stderr)
+                return 2
+            translated.append("--resume")
+            translated.append(args[i + 1])
+            i += 2
+            continue
+        translated.append(a)
+        i += 1
+    # Guarantee the non-interactive JSON event-stream contract in case the
+    # daemon ever omits them.
+    if "--mode" not in translated:
+        translated += ["--mode", "json"]
+    if "-p" not in translated and "--print" not in translated:
+        translated.insert(0, "-p")
+    bin_ = resolve_prime_agent()
+    os.execv(bin_, [bin_] + translated)
+    return 1  # unreachable
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    if not args:
+        # Bare invocation: behave like a version probe so a human can check.
+        return show_version()
+    if "--list-models" in args:
+        return list_models()
+    if "--version" in args or "-v" in args:
+        if len(args) == 1:
+            return show_version()
+    return run_mode(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
