@@ -118,6 +118,12 @@ def run_mode(args: list[str]) -> int:
         translated += ["--mode", "json"]
     if "-p" not in translated and "--print" not in translated:
         translated.insert(0, "-p")
+    # Multica starts a fresh CLI process for each turn. Prime Agent's default
+    # JSON frontend can leave the owned session worker resident after the CLI
+    # exits, which makes the next resume fail with "Session is already active".
+    # The legacy frontend explicitly reaps that worker process group while
+    # preserving the JSON stream contract.
+    os.environ.setdefault("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND", "1")
     bin_ = resolve_prime_agent()
     os.execv(bin_, [bin_] + translated)
     return 1  # unreachable

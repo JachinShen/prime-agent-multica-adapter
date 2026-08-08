@@ -41,6 +41,26 @@ class AdapterTests(unittest.TestCase):
             ["-p", "--mode", "json", "--resume", "/tmp/prime-sessions/123.jsonl"],
         )
 
+
+    def test_enables_worker_cleanup_frontend(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-prime-agent"
+            fake.write_text("#!/bin/sh\nprintf '%s\n' \"$PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND\"\n")
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PRIME_AGENT_BIN"] = str(fake)
+            env.pop("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND", None)
+            result = subprocess.run(
+                [str(ADAPTER), "--mode", "json"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "1")
+
     def test_adds_noninteractive_json_defaults(self):
         result = self.run_with_fake_prime(["--provider", "test"], "/tmp/prime-sessions")
         self.assertEqual(result.returncode, 0, result.stderr)

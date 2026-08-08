@@ -36,6 +36,11 @@ export PRIME_AGENT_SESSION_DIR=/absolute/path/to/shared/sessions
 Only one process should write a session at a time. The adapter intentionally does
 not implement concurrent-session locking or event arbitration.
 
+For Multica's one-process-per-turn execution model, the adapter also enables
+Prime Agent's legacy owned-worker frontend. That frontend reaps the per-turn
+worker after the JSON stream closes, so the next Multica turn can resume the
+same session without a stale `Session is already active` lease.
+
 ## Install
 
 Copy the executable somewhere on the daemon's `PATH`, for example:
