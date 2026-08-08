@@ -19,6 +19,23 @@ Prime Agent uses the same JSON event-stream mode but differs in two CLI details:
 
 This adapter translates those differences and then replaces itself with the Prime Agent process using `execv`, preserving signals, exit codes, and streaming output.
 
+## Unified session storage
+
+Multica passes a session path as a runtime handle. The adapter keeps that file's
+basename but maps it into Prime Agent's canonical session directory, which is
+`~/.prime/agent/sessions` by default. This means Multica-created sessions are
+visible to the normal Prime Agent terminal session browser, and terminal-created
+sessions use the same storage directory.
+
+Override the canonical directory for both processes when needed:
+
+```bash
+export PRIME_AGENT_SESSION_DIR=/absolute/path/to/shared/sessions
+```
+
+Only one process should write a session at a time. The adapter intentionally does
+not implement concurrent-session locking or event arbitration.
+
 ## Install
 
 Copy the executable somewhere on the daemon's `PATH`, for example:

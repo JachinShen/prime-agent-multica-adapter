@@ -20,6 +20,13 @@ import subprocess
 import sys
 
 PRIME_AGENT = os.environ.get("PRIME_AGENT_BIN", "prime-agent")
+# Multica supplies a session filename in its own runtime directory. Keep the
+# filename, but make Prime Agent's session directory the canonical storage
+# location so terminal sessions and Multica sessions are discoverable together.
+PRIME_AGENT_SESSION_DIR = os.environ.get(
+    "PRIME_AGENT_SESSION_DIR",
+    os.path.expanduser("~/.prime/agent/sessions"),
+)
 
 
 def resolve_prime_agent() -> str:
@@ -84,6 +91,11 @@ def list_models() -> int:
     return 0
 
 
+def canonical_session_path(multica_path: str) -> str:
+    """Map Multica's session handle to Prime Agent's canonical session file."""
+    return os.path.join(PRIME_AGENT_SESSION_DIR, os.path.basename(multica_path))
+
+
 def run_mode(args: list[str]) -> int:
     translated: list[str] = []
     i = 0
@@ -95,7 +107,7 @@ def run_mode(args: list[str]) -> int:
                 print("prime-agent-multica: --session requires a value", file=sys.stderr)
                 return 2
             translated.append("--resume")
-            translated.append(args[i + 1])
+            translated.append(canonical_session_path(args[i + 1]))
             i += 2
             continue
         translated.append(a)
