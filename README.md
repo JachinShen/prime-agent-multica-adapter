@@ -41,6 +41,13 @@ Prime Agent's legacy owned-worker frontend. That frontend reaps the per-turn
 worker after the JSON stream closes, so the next Multica turn can resume the
 same session without a stale `Session is already active` lease.
 
+When Multica's **steer** action dispatches a replacement turn before the prior
+process has finished releasing its session lease, the adapter retries only that
+specific `Session is already active` error with exponential backoff. Other
+Prime Agent failures are returned unchanged. Configure the retry window with
+`PRIME_AGENT_MULTICA_RETRY_ATTEMPTS` and `PRIME_AGENT_MULTICA_RETRY_DELAY` if
+needed.
+
 ## Install
 
 Copy the executable somewhere on the daemon's `PATH`, for example:

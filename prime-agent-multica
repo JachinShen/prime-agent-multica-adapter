@@ -16,8 +16,11 @@ through, exit codes propagate).
 """
 
 import os
+import signal
 import subprocess
 import sys
+import threading
+import time
 
 PRIME_AGENT = os.environ.get("PRIME_AGENT_BIN", "prime-agent")
 # Multica supplies a session filename in its own runtime directory. Keep the
@@ -96,6 +99,11 @@ def canonical_session_path(multica_path: str) -> str:
     return os.path.join(PRIME_AGENT_SESSION_DIR, os.path.basename(multica_path))
 
 
+def is_active_session_error(stderr: str) -> bool:
+    """Return whether Prime Agent rejected a turn because a prior turn is ending."""
+    return "session is already active" in stderr.lower()
+
+
 def run_mode(args: list[str]) -> int:
     translated: list[str] = []
     i = 0
@@ -125,8 +133,48 @@ def run_mode(args: list[str]) -> int:
     # preserving the JSON stream contract.
     os.environ.setdefault("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND", "1")
     bin_ = resolve_prime_agent()
-    os.execv(bin_, [bin_] + translated)
-    return 1  # unreachable
+    command = [bin_] + translated
+    max_attempts = int(os.environ.get("PRIME_AGENT_MULTICA_RETRY_ATTEMPTS", "6"))
+    retry_delay = float(os.environ.get("PRIME_AGENT_MULTICA_RETRY_DELAY", "0.5"))
+
+    # A Multica steer can dispatch the replacement turn just before its
+    # cancellation reaches the previous Prime Agent worker. Retry only this
+    # specific lease race; all other failures retain their original status.
+    for attempt in range(max_attempts):
+        child = subprocess.Popen(command, stdin=None, stdout=None, stderr=subprocess.PIPE,
+                                 text=True, env=os.environ.copy())
+        stderr_chunks: list[str] = []
+
+        def forward_stderr() -> None:
+            assert child.stderr is not None
+            for line in child.stderr:
+                stderr_chunks.append(line)
+                sys.stderr.write(line)
+                sys.stderr.flush()
+
+        stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
+        stderr_thread.start()
+
+        def forward_signal(signum: int, _frame: object) -> None:
+            if child.poll() is None:
+                child.send_signal(signum)
+
+        handlers = {}
+        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            handlers[signum] = signal.signal(signum, forward_signal)
+        returncode = child.wait()
+        stderr_thread.join(timeout=5)
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
+
+        stderr = "".join(stderr_chunks)
+        if returncode == 0 or not is_active_session_error(stderr) or attempt + 1 >= max_attempts:
+            if returncode < 0:
+                return 128 - returncode
+            return returncode
+        time.sleep(retry_delay * (2**attempt))
+
+    return 1
 
 
 def main() -> int:

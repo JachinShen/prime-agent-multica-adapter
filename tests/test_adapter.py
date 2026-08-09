@@ -61,6 +61,35 @@ class AdapterTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.strip(), "1")
 
+    def test_retries_transient_active_session_race(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-prime-agent"
+            marker = Path(tmp) / "failed-once"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"if [ ! -f '{marker}' ]; then touch '{marker}'; "
+                "echo 'Error: Session is already active in test-owner' >&2; exit 1; fi\n"
+                "printf '%s\n' success\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env.update(
+                PRIME_AGENT_BIN=str(fake),
+                PRIME_AGENT_MULTICA_RETRY_ATTEMPTS="3",
+                PRIME_AGENT_MULTICA_RETRY_DELAY="0.01",
+            )
+            result = subprocess.run(
+                [str(ADAPTER), "--mode", "json"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "success")
+        self.assertIn("Session is already active", result.stderr)
+
     def test_adds_noninteractive_json_defaults(self):
         result = self.run_with_fake_prime(["--provider", "test"], "/tmp/prime-sessions")
         self.assertEqual(result.returncode, 0, result.stderr)
