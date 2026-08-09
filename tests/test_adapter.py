@@ -98,6 +98,83 @@ class AdapterTests(unittest.TestCase):
             ["-p", "--provider", "test", "--mode", "json"],
         )
 
+    def test_rpc_mode_is_transparent_and_does_not_inject_print(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-prime-agent"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "cat\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PRIME_AGENT_BIN"] = str(fake)
+            result = subprocess.run(
+                [str(ADAPTER), "--mode", "rpc", "--no-session"],
+                cwd=ROOT,
+                env=env,
+                input='{"id":"models","type":"get_available_models"}\n',
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, '{"id":"models","type":"get_available_models"}\n')
+
+    def test_retries_replay_the_prompt_from_start(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-prime-agent"
+            marker = Path(tmp) / "failed-once"
+            attempts = Path(tmp) / "attempts"
+            fake.write_text(
+                "#!/bin/sh\n"
+                f"cat >> '{attempts}'\n"
+                f"if [ ! -f '{marker}' ]; then touch '{marker}'; "
+                "echo 'Session is already active in test-owner' >&2; exit 1; fi\n"
+                "printf '%s\n' success\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env.update(
+                PRIME_AGENT_BIN=str(fake),
+                PRIME_AGENT_MULTICA_RETRY_ATTEMPTS="2",
+                PRIME_AGENT_MULTICA_RETRY_DELAY="0.01",
+            )
+            result = subprocess.run(
+                [str(ADAPTER), "--mode", "json"],
+                cwd=ROOT,
+                env=env,
+                input="replayed prompt\n",
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(attempts.read_text(), "replayed prompt\nreplayed prompt\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "success")
+
+    def test_model_rows_are_normalized_and_diagnostics_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / "fake-prime-agent"
+            fake.write_text(
+                "#!/bin/sh\n"
+                "if [ \"$1\" = model ]; then\n"
+                "  printf '%s\n' 'provider model context' 'openai:gpt-5.5' 'opencode-go  glm-5.2  1M' 'Warning: No models match pattern x'\n"
+                "fi\n"
+            )
+            fake.chmod(fake.stat().st_mode | stat.S_IXUSR)
+            env = os.environ.copy()
+            env["PRIME_AGENT_BIN"] = str(fake)
+            result = subprocess.run(
+                [str(ADAPTER), "--list-models"],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines(), ["openai gpt-5.5", "opencode-go glm-5.2"])
+
 
 if __name__ == "__main__":
     unittest.main()

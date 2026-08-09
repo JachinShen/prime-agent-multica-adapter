@@ -17,7 +17,15 @@ Prime Agent uses the same JSON event-stream mode but differs in two CLI details:
 - `--session` is named `--resume`
 - model discovery is `prime-agent model list`
 
-This adapter translates those differences and then replaces itself with the Prime Agent process using `execv`, preserving signals, exit codes, and streaming output.
+The adapter also preserves Multica's machine-readable `--mode rpc` model-discovery
+handshake. RPC is passed through without injecting print-mode flags. For JSON
+turns, the prompt is spooled once so a lease-race retry can replay the exact
+same stdin bytes; this matters because Multica starts a fresh process for each
+turn.
+
+The adapter translates those differences and then replaces itself with the Prime
+Agent process for RPC, or supervises the JSON turn when it needs the narrow
+session-lease retry. Signals, exit codes, and streaming output are preserved.
 
 ## Unified session storage
 

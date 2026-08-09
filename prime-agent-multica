@@ -16,9 +16,12 @@ through, exit codes propagate).
 """
 
 import os
+import re
 import signal
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -67,6 +70,52 @@ def show_version() -> int:
     return r.returncode
 
 
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def _is_model_discovery_noise(line: str) -> bool:
+    low = line.lower().strip()
+    return (
+        not low
+        or low == "provider model context max-out thinking images"
+        or low.startswith(("warning", "error", "info", "debug", "(node:", "node:"))
+        or "no models match pattern" in low
+    )
+
+
+def _iter_model_rows(output: str):
+    """Yield the provider/model rows understood by Multica's Pi parser.
+
+    Multica accepts both the historical ``provider:model`` form and the newer
+    whitespace table.  Keep this parser deliberately conservative: diagnostics
+    printed by the Node launcher must never become fake models.
+    """
+    seen = set()
+    for raw in output.splitlines():
+        line = _ANSI_RE.sub("", raw).strip()
+        if _is_model_discovery_noise(line):
+            continue
+        fields = line.split()
+        if not fields:
+            continue
+        first = fields[0]
+        if first.lower() == "provider":
+            continue
+        if ":" in first or "/" in first:
+            model_id = first.replace(":", "/", 1)
+        elif len(fields) >= 2:
+            model_id = f"{first}/{fields[1]}"
+        else:
+            continue
+        provider, sep, model = model_id.partition("/")
+        if not provider or not sep or not model:
+            continue
+        if model_id in seen:
+            continue
+        seen.add(model_id)
+        yield provider, model
+
+
 def list_models() -> int:
     bin_ = resolve_prime_agent()
     try:
@@ -75,28 +124,26 @@ def list_models() -> int:
         print(f"prime-agent-multica: model list failed: {e}", file=sys.stderr)
         return 1
     combined = (r.stdout or "") + "\n" + (r.stderr or "")
-    for line in combined.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        fields = line.split()
-        if len(fields) < 2:
-            continue
-        prov, model = fields[0], fields[1]
-        low = prov.lower()
-        if low == "provider":
-            continue  # table header
-        if low.startswith("(") or low.startswith("warning") or low.startswith("error") or low.startswith("info"):
-            continue  # node shim warnings / diagnostics
-        if "node:" in prov.lower():
-            continue
-        print(f"{prov} {model}")
-    return 0
+    for provider, model in _iter_model_rows(combined):
+        # The native Pi adapter emits a normalized two-column table.  The
+        # Multica parser then turns this into provider/model IDs.
+        print(f"{provider} {model}")
+    # Preserve the probe's failure status even when a provider printed a
+    # partial catalog before failing.
+    return r.returncode
 
 
 def canonical_session_path(multica_path: str) -> str:
-    """Map Multica's session handle to Prime Agent's canonical session file."""
-    return os.path.join(PRIME_AGENT_SESSION_DIR, os.path.basename(multica_path))
+    """Map Multica's opaque session handle to Prime Agent's session file."""
+    name = os.path.basename(multica_path)
+    if not name or name in {".", ".."}:
+        raise ValueError("--session requires a file path")
+    directory = os.path.abspath(os.path.expanduser(PRIME_AGENT_SESSION_DIR))
+    # Prime Agent creates the file itself, but not every version creates the
+    # parent directory when --resume receives a path.  Native Multica's Pi
+    # backend guarantees its session directory before spawning the process.
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    return os.path.join(directory, name)
 
 
 def is_active_session_error(stderr: str) -> bool:
@@ -104,75 +151,152 @@ def is_active_session_error(stderr: str) -> bool:
     return "session is already active" in stderr.lower()
 
 
-def run_mode(args: list[str]) -> int:
+def _mode_value(args: list[str]):
+    for i, arg in enumerate(args):
+        if arg == "--mode" and i + 1 < len(args):
+            return args[i + 1]
+        if arg.startswith("--mode="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _translate_args(args: list[str]):
+    """Translate the Multica Pi argv while retaining RPC as a real protocol.
+
+    Multica's model discovery first tries ``pi --mode rpc``.  This must not be
+    turned into print mode: the caller sends JSON-RPC requests on stdin and
+    expects JSON-RPC responses on stdout.  Only the task JSON/print path needs
+    the session and owned-worker compatibility behavior.
+    """
     translated: list[str] = []
     i = 0
-    n = len(args)
-    while i < n:
-        a = args[i]
-        if a == "--session":
-            if i + 1 >= n:
-                print("prime-agent-multica: --session requires a value", file=sys.stderr)
-                return 2
-            translated.append("--resume")
-            translated.append(canonical_session_path(args[i + 1]))
+    while i < len(args):
+        arg = args[i]
+        if arg == "--session":
+            if i + 1 >= len(args):
+                raise ValueError("--session requires a value")
+            translated.extend(("--resume", canonical_session_path(args[i + 1])))
             i += 2
             continue
-        translated.append(a)
+        if arg.startswith("--session="):
+            translated.extend(("--resume", canonical_session_path(arg.split("=", 1)[1])))
+            i += 1
+            continue
+        translated.append(arg)
         i += 1
-    # Guarantee the non-interactive JSON event-stream contract in case the
-    # daemon ever omits them.
-    if "--mode" not in translated:
-        translated += ["--mode", "json"]
-    if "-p" not in translated and "--print" not in translated:
-        translated.insert(0, "-p")
+
+    mode = _mode_value(translated) or "json"
+    if mode != "rpc":
+        # Guarantee the non-interactive JSON event-stream contract in case the
+        # daemon ever omits these flags.  RPC must remain untouched.
+        if _mode_value(translated) is None:
+            translated += ["--mode", "json"]
+            mode = "json"
+        if mode == "json" and "-p" not in translated and "--print" not in translated:
+            translated.insert(0, "-p")
+    return translated, mode
+
+
+def _spool_stdin():
+    """Capture one finite Multica prompt so a retry can replay it exactly."""
+    source = getattr(sys.stdin, "buffer", sys.stdin)
+    prompt = tempfile.TemporaryFile(mode="w+b")
+    shutil.copyfileobj(source, prompt, length=1024 * 1024)
+    prompt.seek(0)
+    return prompt
+
+
+def _run_rpc(command: list[str], env: dict[str, str]) -> int:
+    """Replace the adapter with Prime Agent for the streaming RPC protocol."""
+    try:
+        os.execvpe(command[0], command, env)
+    except OSError as exc:
+        print(f"prime-agent-multica: failed to start RPC adapter: {exc}", file=sys.stderr)
+        return 127
+    return 127  # execvpe either replaces the process or raises
+
+
+def run_mode(args: list[str]) -> int:
+    try:
+        translated, mode = _translate_args(args)
+    except (OSError, ValueError) as exc:
+        print(f"prime-agent-multica: {exc}", file=sys.stderr)
+        return 2
+
+    bin_ = resolve_prime_agent()
+    command = [bin_] + translated
+    env = os.environ.copy()
+
+    # RPC discovery is already a long-lived stdin/stdout protocol.  Do not
+    # enable the owned-worker frontend or consume stdin before Prime Agent can
+    # receive its JSON requests.
+    if mode == "rpc":
+        return _run_rpc(command, env)
+
     # Multica starts a fresh CLI process for each turn. Prime Agent's default
     # JSON frontend can leave the owned session worker resident after the CLI
     # exits, which makes the next resume fail with "Session is already active".
     # The legacy frontend explicitly reaps that worker process group while
     # preserving the JSON stream contract.
-    os.environ.setdefault("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND", "1")
-    bin_ = resolve_prime_agent()
-    command = [bin_] + translated
-    max_attempts = int(os.environ.get("PRIME_AGENT_MULTICA_RETRY_ATTEMPTS", "6"))
-    retry_delay = float(os.environ.get("PRIME_AGENT_MULTICA_RETRY_DELAY", "0.5"))
+    env.setdefault("PRIME_AGENT_INTERNAL_LEGACY_OWNED_WORKER_FRONTEND", "1")
+    try:
+        max_attempts = int(os.environ.get("PRIME_AGENT_MULTICA_RETRY_ATTEMPTS", "6"))
+    except ValueError:
+        max_attempts = 6
+    try:
+        retry_delay = float(os.environ.get("PRIME_AGENT_MULTICA_RETRY_DELAY", "0.5"))
+    except ValueError:
+        retry_delay = 0.5
+    max_attempts = max(1, min(max_attempts, 20))
+    retry_delay = max(0.0, min(retry_delay, 60.0))
 
-    # A Multica steer can dispatch the replacement turn just before its
-    # cancellation reaches the previous Prime Agent worker. Retry only this
-    # specific lease race; all other failures retain their original status.
-    for attempt in range(max_attempts):
-        child = subprocess.Popen(command, stdin=None, stdout=None, stderr=subprocess.PIPE,
-                                 text=True, env=os.environ.copy())
-        stderr_chunks: list[str] = []
+    # A steer can dispatch the replacement turn just before cancellation
+    # reaches the previous worker. The original prompt is finite, so spooling
+    # it once lets every retry receive the exact same bytes. Inheriting stdin
+    # (the old implementation) left retries at EOF after attempt one.
+    with _spool_stdin() as prompt_file:
+        for attempt in range(max_attempts):
+            prompt_file.seek(0)
+            try:
+                child = subprocess.Popen(
+                    command,
+                    stdin=prompt_file,
+                    stdout=None,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    env=env,
+                )
+            except OSError as exc:
+                print(f"prime-agent-multica: failed to start Prime Agent: {exc}", file=sys.stderr)
+                return 127
+            stderr_chunks: list[str] = []
 
-        def forward_stderr() -> None:
-            assert child.stderr is not None
-            for line in child.stderr:
-                stderr_chunks.append(line)
-                sys.stderr.write(line)
-                sys.stderr.flush()
+            def forward_stderr() -> None:
+                assert child.stderr is not None
+                for line in child.stderr:
+                    stderr_chunks.append(line)
+                    sys.stderr.write(line)
+                    sys.stderr.flush()
 
-        stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
-        stderr_thread.start()
+            stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
+            stderr_thread.start()
 
-        def forward_signal(signum: int, _frame: object) -> None:
-            if child.poll() is None:
-                child.send_signal(signum)
+            handlers = {}
+            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+                handlers[signum] = signal.signal(signum, lambda _s, _f, c=child: c.send_signal(_s) if c.poll() is None else None)
+            try:
+                returncode = child.wait()
+            finally:
+                for signum, handler in handlers.items():
+                    signal.signal(signum, handler)
+            stderr_thread.join(timeout=5)
 
-        handlers = {}
-        for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-            handlers[signum] = signal.signal(signum, forward_signal)
-        returncode = child.wait()
-        stderr_thread.join(timeout=5)
-        for signum, handler in handlers.items():
-            signal.signal(signum, handler)
-
-        stderr = "".join(stderr_chunks)
-        if returncode == 0 or not is_active_session_error(stderr) or attempt + 1 >= max_attempts:
-            if returncode < 0:
-                return 128 - returncode
-            return returncode
-        time.sleep(retry_delay * (2**attempt))
+            stderr = "".join(stderr_chunks)
+            if returncode == 0 or not is_active_session_error(stderr) or attempt + 1 >= max_attempts:
+                if returncode < 0:
+                    return 128 - returncode
+                return returncode
+            time.sleep(retry_delay * (2**attempt))
 
     return 1
 
