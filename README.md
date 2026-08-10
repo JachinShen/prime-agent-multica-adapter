@@ -52,9 +52,13 @@ same session without a stale `Session is already active` lease.
 When Multica's **steer** action dispatches a replacement turn before the prior
 process has finished releasing its session lease, the adapter retries only that
 specific `Session is already active` error with exponential backoff. Other
-Prime Agent failures are returned unchanged. Configure the retry window with
-`PRIME_AGENT_MULTICA_RETRY_ATTEMPTS` and `PRIME_AGENT_MULTICA_RETRY_DELAY` if
-needed.
+Prime Agent failures are returned unchanged. Configure the bounded retry policy
+with `PRIME_AGENT_MULTICA_RETRY_ATTEMPTS`, `PRIME_AGENT_MULTICA_RETRY_DELAY`,
+and `PRIME_AGENT_MULTICA_RETRY_WINDOW` if needed. Cancellation forwards to the
+whole POSIX turn process group, waits for a finite
+`PRIME_AGENT_MULTICA_SHUTDOWN_TIMEOUT` grace period, then force-reaps that
+group. A live lease owner is never deleted by the adapter; Prime Agent reclaims
+a lease only after its recorded owner process is gone.
 
 ## Install
 
