@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import time
+from typing import Optional
 
 PRIME_AGENT = os.environ.get("PRIME_AGENT_BIN", "prime-agent")
 # Multica supplies a session filename in its own runtime directory. Keep the
@@ -206,6 +207,84 @@ def _spool_stdin():
     return prompt
 
 
+def _forward_child_signal(child: subprocess.Popen, signum: int) -> None:
+    """Signal the adapter child and its POSIX descendants as one turn."""
+    if child.poll() is not None or child.pid is None:
+        return
+    if os.name == "posix":
+        try:
+            # The child is started with start_new_session=True. Prime Agent's
+            # owned frontend can otherwise leave a worker holding the lease
+            # after the one-shot adapter has been cancelled.
+            os.killpg(child.pid, signum)
+            return
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        child.send_signal(signum)
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _force_child_tree(child: subprocess.Popen) -> None:
+    """Forcefully reap a cancelled child without touching other processes."""
+    if child.poll() is not None:
+        return
+    if os.name == "posix" and child.pid is not None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            pass
+    try:
+        child.kill()
+    except (OSError, ProcessLookupError):
+        pass
+
+
+def _popen_turn_kwargs() -> dict[str, object]:
+    """Put each turn in an isolated group while retaining Windows support."""
+    if os.name == "posix":
+        return {"start_new_session": True}
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return {"creationflags": creationflags} if creationflags else {}
+
+
+def _wait_for_child(
+    child: subprocess.Popen,
+    termination_requested: threading.Event,
+    shutdown_timeout: float,
+) -> int:
+    """Wait for a turn, escalating cancellation after a finite grace period."""
+    deadline: Optional[float] = None
+    while True:
+        returncode = child.poll()
+        if returncode is not None:
+            return returncode
+        if termination_requested.is_set():
+            if deadline is None:
+                deadline = time.monotonic() + shutdown_timeout
+            if time.monotonic() >= deadline:
+                _force_child_tree(child)
+                # SIGKILL/TerminateProcess should be immediate. Keep the
+                # reaping wait finite so a broken child cannot pin the daemon.
+                force_wait = max(0.25, min(5.0, shutdown_timeout or 0.25))
+                for _ in range(2):
+                    try:
+                        return child.wait(timeout=force_wait)
+                    except subprocess.TimeoutExpired:
+                        _force_child_tree(child)
+                print(
+                    "prime-agent-multica: cancelled child did not exit after force-kill",
+                    file=sys.stderr,
+                )
+                return child.poll() if child.poll() is not None else 137
+        time.sleep(0.05)
+
+
+def _termination_exit_code(signum: Optional[int]) -> int:
+    return 128 + signum if signum is not None else 1
+
+
 def _run_rpc(command: list[str], env: dict[str, str]) -> int:
     """Replace the adapter with Prime Agent for the streaming RPC protocol."""
     try:
@@ -247,56 +326,105 @@ def run_mode(args: list[str]) -> int:
         retry_delay = float(os.environ.get("PRIME_AGENT_MULTICA_RETRY_DELAY", "0.5"))
     except ValueError:
         retry_delay = 0.5
+    try:
+        retry_window = float(os.environ.get("PRIME_AGENT_MULTICA_RETRY_WINDOW", "30"))
+    except ValueError:
+        retry_window = 30.0
+    try:
+        shutdown_timeout = float(os.environ.get("PRIME_AGENT_MULTICA_SHUTDOWN_TIMEOUT", "5"))
+    except ValueError:
+        shutdown_timeout = 5.0
     max_attempts = max(1, min(max_attempts, 20))
     retry_delay = max(0.0, min(retry_delay, 60.0))
+    retry_window = max(0.0, min(retry_window, 300.0))
+    shutdown_timeout = max(0.0, min(shutdown_timeout, 60.0))
 
-    # A steer can dispatch the replacement turn just before cancellation
-    # reaches the previous worker. The original prompt is finite, so spooling
-    # it once lets every retry receive the exact same bytes. Inheriting stdin
-    # (the old implementation) left retries at EOF after attempt one.
-    with _spool_stdin() as prompt_file:
-        for attempt in range(max_attempts):
-            prompt_file.seek(0)
-            try:
-                child = subprocess.Popen(
-                    command,
-                    stdin=prompt_file,
-                    stdout=None,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    env=env,
+    termination_requested = threading.Event()
+    termination_signal: list[Optional[int]] = [None]
+    active_child: list[subprocess.Popen | None] = [None]
+
+    def handle_signal(signum: int, _frame: object) -> None:
+        if termination_signal[0] is None:
+            termination_signal[0] = signum
+        termination_requested.set()
+        child = active_child[0]
+        if child is not None:
+            _forward_child_signal(child, signum)
+
+    signals = [getattr(signal, name) for name in ("SIGINT", "SIGTERM", "SIGHUP") if hasattr(signal, name)]
+    handlers: dict[int, object] = {}
+    for signum in signals:
+        handlers[signum] = signal.signal(signum, handle_signal)
+
+    try:
+        # A steer can dispatch the replacement turn just before cancellation
+        # reaches the previous worker. The original prompt is finite, so
+        # spooling it once lets every retry receive the exact same bytes.
+        with _spool_stdin() as prompt_file:
+            retry_started = time.monotonic()
+            for attempt in range(max_attempts):
+                if termination_requested.is_set():
+                    return _termination_exit_code(termination_signal[0])
+                prompt_file.seek(0)
+                try:
+                    child = subprocess.Popen(
+                        command,
+                        stdin=prompt_file,
+                        stdout=None,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                        env=env,
+                        **_popen_turn_kwargs(),
+                    )
+                except OSError as exc:
+                    print(f"prime-agent-multica: failed to start Prime Agent: {exc}", file=sys.stderr)
+                    return 127
+                active_child[0] = child
+                stderr_chunks: list[str] = []
+
+                def forward_stderr() -> None:
+                    assert child.stderr is not None
+                    try:
+                        for line in child.stderr:
+                            stderr_chunks.append(line)
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                    except (OSError, ValueError):
+                        # Cancellation may close the pipe while a detached
+                        # worker still owns its write end.
+                        pass
+
+                stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
+                stderr_thread.start()
+                returncode = _wait_for_child(child, termination_requested, shutdown_timeout)
+                active_child[0] = None
+                stderr_thread.join(timeout=1)
+                if stderr_thread.is_alive() and child.stderr is not None:
+                    child.stderr.close()
+                    stderr_thread.join(timeout=1)
+
+                if termination_requested.is_set():
+                    return _termination_exit_code(termination_signal[0])
+                stderr = "".join(stderr_chunks)
+                if returncode == 0 or not is_active_session_error(stderr) or attempt + 1 >= max_attempts:
+                    if returncode < 0:
+                        return 128 - returncode
+                    return returncode
+
+                elapsed = time.monotonic() - retry_started
+                delay = min(retry_delay * (2**attempt), max(0.0, retry_window - elapsed))
+                print(
+                    f"prime-agent-multica: active session; retry {attempt + 2}/{max_attempts} "
+                    f"in {delay:.3g}s",
+                    file=sys.stderr,
                 )
-            except OSError as exc:
-                print(f"prime-agent-multica: failed to start Prime Agent: {exc}", file=sys.stderr)
-                return 127
-            stderr_chunks: list[str] = []
-
-            def forward_stderr() -> None:
-                assert child.stderr is not None
-                for line in child.stderr:
-                    stderr_chunks.append(line)
-                    sys.stderr.write(line)
-                    sys.stderr.flush()
-
-            stderr_thread = threading.Thread(target=forward_stderr, daemon=True)
-            stderr_thread.start()
-
-            handlers = {}
-            for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
-                handlers[signum] = signal.signal(signum, lambda _s, _f, c=child: c.send_signal(_s) if c.poll() is None else None)
-            try:
-                returncode = child.wait()
-            finally:
-                for signum, handler in handlers.items():
-                    signal.signal(signum, handler)
-            stderr_thread.join(timeout=5)
-
-            stderr = "".join(stderr_chunks)
-            if returncode == 0 or not is_active_session_error(stderr) or attempt + 1 >= max_attempts:
-                if returncode < 0:
-                    return 128 - returncode
-                return returncode
-            time.sleep(retry_delay * (2**attempt))
+                if termination_requested.wait(delay):
+                    return _termination_exit_code(termination_signal[0])
+                if time.monotonic() - retry_started >= retry_window:
+                    return returncode
+    finally:
+        for signum, handler in handlers.items():
+            signal.signal(signum, handler)
 
     return 1
 
